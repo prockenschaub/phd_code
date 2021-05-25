@@ -1,0 +1,850 @@
+---
+title: "Untitled"
+output:
+  pdf_document: 
+    keep_tex: true
+params:
+  time_window: 30
+  fit_method: "gee"
+  bootstrap_nneh: 200
+  format: "latex"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r init, include = FALSE}
+
+# Path from project directory to this file
+# NOTE: must be set in each programme separately
+subfolder <- "chapter_4"
+
+# Initialise the workspace
+source(file.path(subfolder, "00_init.R"))
+source(file.path(subfolder, "00_tabulation.R"))
+
+# Infrastructure packages
+library(knitr)
+library(kableExtra)
+library(broom)
+library(broom.mixed)
+library(forcats)
+library(ggplot2)
+library(testthat)
+
+# Analysis packages
+library(tableone)
+library(geepack)
+library(splines)
+library(emmeans)
+library(glmmTMB)
+
+# Shorten parameters
+time_window <- params$time_window
+bootstrap_nneh <- params$bootstrap_nneh
+format <- params$format
+ 
+```
+
+```{r determine-method}
+
+if(params$fit_method == "glm"){
+  fit <- fit_glm
+} else if(params$fit_method == "gee") {
+  fit <- fit_gee
+} else{
+  stop("Unsupported fit method supplied.")
+}
+
+```
+
+```{r load-data}
+
+patients <- load_derived("patients")
+
+epi <- load_derived(str_c("epi_", time_window))
+setorder(epi, patid, start)
+
+```
+
+```{r limit-adults}
+
+# Determine the day the patient turns 18
+patients[, turn_18 := birth_date %m+% years(18)]
+patients[, enter_date := pmax(enter_date, turn_18)]
+
+# Limit patients' observation periods to only that time after 18
+adults <- patients[enter_date < leave_date]
+epi <- epi %>% 
+  .[(adults[, .(patid, enter_date)]), on = "patid", nomatch = 0] %>% 
+  .[start >= enter_date] %>% 
+  .[, !("enter_date")]
+
+```
+
+```{r define-followup}
+
+fu <- substitute(
+  time_length(enter_date %--% leave_date, unit = "years")  + 1/365
+)
+
+```
+
+```{r summ-measures-adults}
+
+# Counts
+nrow(adults)
+with(adults, sum(eval(fu)))
+length(unique(epi$patid))
+
+```
+
+```{r add-age-cutoffs}
+
+epi[, age_65 := factor(age >= 65, c(FALSE, TRUE), c("<65", "65+"))]
+epi[, age_50_80 := cut(age, c(-Inf, 50, 80, Inf), c("<50", "50-80", "80+"), right = FALSE)]
+
+```
+
+```{r progression}
+
+# Redefine progression to severe UTI as the main outcome
+epi[, compl := fct_yesno(pyelo == "yes" | sep == "yes" | hosp_uti == "yes" )]
+
+```
+
+# Remark Table 1
+
+```{r create-rmk-tbl-1}
+
+tbl_def <- function(){
+  list(
+    "\\textbf{Total (row-\\%)}" = tab(total ~ female + age_65, col = FALSE),
+    "\\textbf{Immediate treatment (\\%)}" = tab(presc ~ female + age_65, 
+                                keep_only = "yes"),
+   
+    "Outcomes" = list(
+      "Complication (\\%)" = tab(compl ~ female + age_65, 
+                     keep_only = "yes"),
+      "Died (\\%)" = tab(died ~ female + age_65, 
+                   keep_only = "yes"),
+      "Hospitalisation for LRTI (\\%)" = tab(hosp_lrti ~ female + age_65, 
+                                      keep_only = "yes"),
+      "Other hospitalisation (\\%)" = tab(other_hosp ~ female + age_65, 
+                                      keep_only = "yes")
+    )
+  )
+}
+
+epi[, total := "total"]
+tbl_rmk_1 <- tbl_def() %>% render_tab(epi)
+
+
+```
+
+```{r render-rmk-tbl-1}
+
+# Render with kable
+tbl_rmk_1_rend <- 
+  tbl_rmk_1 %>%
+  rbindlist() %>% 
+  kable(
+    "latex", 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", "r", "r", "r", "r"),
+    escape = FALSE,
+    col.names = c("", "<65", "$\\geq$65", "<65", "$\\geq$65"),
+    caption = "Remark 1" 
+  )
+
+tbl_rmk_1_rend %<>% 
+  kable_styling(latex_options = "HOLD_position") %>% 
+  add_header_above(c(" " = 1, "Men" = 2, "Women" = 2)) %>% 
+  row_spec(0, align = "c") %>% 
+  annotate_table(tbl_rmk_1)
+
+tbl_rmk_1_rend  
+
+```
+
+
+
+# Table 1
+
+
+```{r limit-to-women}
+
+women <- adults[female == 1, !("female")]
+
+epi %<>% .[(women[, .(patid)]), on = "patid", nomatch = 0]
+setorder(epi, patid, start)
+
+```
+
+```{r summ-measures-women}
+
+# Counts
+nrow(women)
+with(women, sum(eval(fu)))
+
+nrow(epi)
+length(unique(epi$patid))
+length(unique(epi$patid)) / nrow(women)
+
+# Rates
+women_uti <- merge(
+  women[, fu := eval(fu)], # Length of follow-up per woman
+  epi[, .N, by = "patid"], # Number of UTI per woman
+  by = "patid", all.x = TRUE
+)
+
+women_uti[is.na(N), N := 0]
+expect_equal(nrow(women), nrow(women_uti))
+
+fit_rate <- glmmTMB(N ~ 1, 
+                    offset = log(fu),
+                    data = women_uti, 
+                    family = nbinom2)
+
+est_rate <- tidy(fit_rate, effects = "fixed", conf.int = TRUE)
+setDT(est_rate)
+est_rate %<>% .[, .(estimate, conf.low, conf.high)]
+est_rate[, map(.SD, ~ 1000 * exp(.))]
+
+mean(women_uti[N > 0]$N)
+
+```
+
+```{r create-tbl-1}
+
+vars <- c("age", "imd", "region", "cci", "smoke", "year", "recur", "abx_30",
+            "home","hosp_7", "hosp_30", "hosp_nights", "hosp_n", "ae_30", "ae_n",  
+            "compl", "pyelo", "sep", "hosp_uti", "hosp_lrti", "other_hosp", "died")
+
+tbl_1_total <- CreateTableOne(vars, data = epi)
+tbl_1_strat <- CreateTableOne(vars, strata = "presc", data = epi)
+
+```
+
+```{r render-tbl-1}
+
+shell_1 <- read_excel(file.path(subfolder, "table_shells.xlsx"), sheet = "table_1")
+setDT(shell_1)
+
+# Extract the table from the `tableone` object
+tbl_1 <- 
+  list(tbl_1_total, tbl_1_strat) %>% 
+  map(print, dropEqual = TRUE, printToggle = FALSE) %>% 
+  reduce(cbind) %>%
+  as.data.table(keep.rownames = "var") %>% 
+  .[, !("test")]
+
+tbl_1 %<>% .[, map(.SD, str_trim)]
+
+# Remove the headers
+tbl_1[ , p := if_else(p == "" & lag(p) != "", lag(p), p, p)] 
+tbl_1 %<>% .[Overall != ""]
+
+# Merge to the table shell
+tbl_1 %<>% .[shell_1, on = "var", nomatch = 0]
+tbl_1[, label := str_replace(label, "\\%", "\\\\%")]
+tbl_1[, label := str_replace(label, "\\&", "\\\\&")]
+
+
+# Bold those columns without headers
+tbl_1[is.na(header), label := cell_spec(label, "latex", bold = TRUE, escape = FALSE)]
+
+# Render the table in latex
+tbl_1_rend <- 
+  tbl_1[, c("label", "Overall", "yes", "no", "p")] %>% 
+  kable(
+    "latex", 
+    booktabs = TRUE,
+    linesep = "",
+    col.names = c("", "Overall", "Yes", "No", "p-value"),
+    escape = FALSE,
+    caption = "Table 1" 
+  )
+
+# Add row headers
+rhead_1 <- tbl_1 %>% 
+  .[, .(header, row = 1:.N)] %>% 
+  .[!is.na(header), .(start = min(row), end = max(row)), by = header]
+
+for(i in 1:nrow(rhead_1)){
+  tbl_1_rend %<>% 
+    pack_rows(rhead_1[i]$header, rhead_1[i]$start, rhead_1[i]$end)
+}
+
+# Add column headers
+chead_1 <- c(2, 2, 1)
+names(chead_1) <- c(" ", linebreak("Immediate\nantibiotic prescription", "c", T), " ")
+
+tbl_1_rend %<>% add_header_above(chead_1, escape = FALSE)
+
+# Print the table
+tbl_1_rend
+
+```
+
+
+
+
+# Table 2
+
+```{r recode-continous-vars}
+
+# Re-center and rescale the main continuous variables
+epi[, age_scl := .((age - 65) / 5)]
+epi[, hosp_weeks := hosp_nights / 7]
+epi[, hosp_per5 := hosp_n / 5]
+epi[, ae_per5 := ae_n / 5]
+
+```
+
+```{r table-shell-helper-functions}
+
+add_shell_headers <- function(rend, shell){
+  # Add the category headers based on the table shell instead of the list
+  # definition that was used above
+  
+  headers <- unique(shell[!is.na(header)]$header)
+  for(h in headers){
+    ids <- which(shell$header == h)
+    rend %<>% group_rows(h, min(ids), max(ids)) 
+  }
+  rend
+}
+
+
+escape_column <- function(shell, col){
+  # Escape certain latex characters with \
+  shell[, c(col) := str_replace(get(col), "\\%", "\\\\%")]
+  shell[, c(col) := str_replace(get(col), "\\&", "\\\\&")]
+}
+
+
+render_effects <- function(table, shell, col.names, header = NULL, caption = ""){
+  
+  render <- 
+    table %>% 
+    kable(
+      "latex", 
+      booktabs = TRUE,
+      linesep = "",
+      escape = FALSE,
+      col.names = col.names,
+      caption = caption
+    ) 
+  
+  render %<>%  
+    kable_styling() %>% 
+    add_shell_headers(shell)
+    
+  if(!is.null(header)){
+    render %<>% add_header_above(header)
+  }
+
+  render
+}
+
+```
+
+```{r define-covariates}
+# Divide the variables into outcomes and covariates
+# OLD: 
+#outcomes <- c("pyelo", "sep", "hosp_uti", "died", "hosp_lrti", "other_hosp")
+#outcome_labels <- c("Pyelonephritis", "Bloodstream infection", "Hospitalisation (UTI)", "Mortality", "Hospitalisation (LRTI)", "Hospitalisation (other)")
+outcomes <- c("compl", "died", "hosp_lrti", "other_hosp")
+outcome_labels <- c("Progression to severe UTI", "Mortality", "Hospitalisation (LRTI)", "Hospitalisation (other)")
+names(outcome_labels) <- outcomes
+
+covars <- c("age_scl", "imd", "region", "cci", "smoke", "year", "recur", "abx_30",
+            "home", "hosp_30", "hosp_per5", "hosp_weeks", "ae_30", "ae_per5")
+
+```
+
+```{r compl-crude}
+
+# Calculate crude and adjusted coefficients
+compl_crude <- c("presc", covars) %>% 
+  map(~ fit(as.formula(str_c("compl == 'yes' ~", .)), data = epi))
+
+```
+
+```{r all-adjusted}
+
+models_adj <- list()
+
+for(out in outcomes){
+  models_adj[[out]] <- fit(as.formula(str_c(out, " == 'yes' ~ presc + ", str_c(covars, collapse = " + "))), data = epi) 
+}
+
+```
+
+
+```{r render-tbl-2}
+
+# Retrieve the appropriate table shell
+shell_2 <- read_excel(file.path(subfolder, "table_shells.xlsx"), sheet = "table_2")
+setDT(shell_2)
+
+shell_2 %<>% escape_column("label")
+
+# Combine with the data
+tbl_2 <- 
+  list(
+    shell_2,
+    map_df(compl_crude, or_p),
+    or_p(models_adj[['compl']])
+  ) %>% reduce(merge, by = "term", all.x = TRUE, sort = FALSE)
+
+tbl_2[is.na(or.x), c("or.x", "or.y") := "1"]
+tbl_2[is.na(p.value.x), c("p.value.x", "p.value.y") := ""]
+
+# Bolden rows without a header
+tbl_2[is.na(header), label := cell_spec(label, "latex", bold = TRUE)]
+
+# Render
+chead_2 <- c(1, 2, 2)
+names(chead_2) <- c(" ", "Univariable analysis", "Multivariable analysis")
+
+render_effects(tbl_2[, !(c("term", "header"))], 
+               shell_2, 
+               col.names = c("Patient characteristics", rep(c("OR [95\\%-CI]", "p-value"), 2)),
+               header = chead_2)
+
+```
+
+
+# Figure 3
+
+```{r fig-3}
+
+fig_shell_3 <- read_excel(file.path(subfolder, "table_shells.xlsx"), sheet = "figure_3")
+setDT(fig_shell_3)
+
+coef_adj <- models_adj %>% 
+  map_df(~ or_p(., to_print = FALSE), .id = "outcome") %>% 
+  copy()
+
+coef_adj[, outcome := factor(outcome, levels = rev(outcomes), labels = rev(outcome_labels))]
+coef_adj[, term_det := factor(term, levels = fig_shell_3$term, labels = fig_shell_3$label)]
+coef_adj[, estimate := log(estimate)]
+coef_adj[, conf.low := log(conf.low)]
+coef_adj[, conf.high := log(conf.high)]
+
+coef_adj[term %like% "presc|age|cci|recur|hosp|ae|abx|home"] %>% 
+  ggplot(aes(term_det, estimate, ymin = conf.low, ymax = conf.high, colour = outcome)) + 
+  geom_pointrange(position = position_dodge(width = 0.9)) + 
+  geom_hline(yintercept = 0) + 
+  scale_y_continuous(breaks = log(c(0.5, 0.75, 1, 1.25, 2, 4)),
+                     labels = c(0.5, 0.75, 1, 1.25, 2, 4)) +
+  scale_color_viridis_d(begin = 0.1, end = 0.9, 
+                        limits = outcome_labels) + 
+  facet_wrap(~ term_det, scales = "free_y", ncol = 1) + 
+  labs(x = "",
+       y = "\nAdjusted odds ratio (95% confidence interval)",
+       colour = "") + 
+  guides(colour = guide_legend(ncol = 2, )) + 
+  coord_flip() + 
+  theme_bw() + 
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        axis.ticks.y = element_blank(),
+        strip.background = element_blank(),
+        strip.text = element_blank(), 
+        legend.position = "bottom",
+        legend.background = element_rect(fill = "white", color = "black"),
+        legend.box.margin = margin(t = 1, unit = "lines"))
+
+ggsave(file.path(subfolder, "03_images", "fig-3.png"), dpi=600, width=7, height=8)
+
+```
+
+
+# Table 3
+
+```{r define-age-interactions}
+
+find_best_age <- function(df, outcome, covars, fit = fit_glm){
+  
+  # Set up basic formulas
+  form <- as.formula(str_c(outcome, ' == "yes" ~ ', str_c(covars, collapse = "+")))
+  form_barren <- update(form, ~ . - presc - age_scl)
+  
+  # Fit models without interaction
+  lin <- fit(update(form_barren, ~ . + presc + poly(age, 1)), data = df)
+  qua <- fit(update(form_barren, ~ . + presc + poly(age, 2)), data = df)
+  cub <- fit(update(form_barren, ~ . + presc + poly(age, 3)), data = df)
+  sp1 <- fit(update(form_barren, ~ . + presc + ns(age, knots = 65, Boundary.knots = c(18, 112))), data = df)
+  sp2 <- fit(update(form_barren, ~ . + presc + ns(age, knots = c(50, 80), Boundary.knots = c(18, 112))), data = df)
+  
+  ni_mod <- list(lin = lin, qua = qua, cub = cub, sp1 = sp1, sp2 = sp2)
+  ni_ic <- map_dbl(ni_mod, IC)
+  
+  best_2 <- if(IC(sp1) < IC(qua)) "sp1" else "qua"
+  best_3 <- if(IC(sp2) < IC(cub)) "sp2" else "cub"
+  
+  # Fit models with stratification
+  lt <- fit(update(form_barren, ~ . + presc), data = df[age < 65])
+  gt <- fit(update(form_barren, ~ . + presc), data = df[age >= 65])
+  
+  s_ic <- map(list(lt = lt, gt = gt), IC)
+  
+  # Fit models with age interaction
+  i1 <- fit(update(form_barren, ~ . + presc * poly(age, 1)), data = df)
+  i2 <- switch(best_2, 
+    qua = fit(update(form_barren, ~ . + presc * poly(age, 2)), data = df),
+    sp1 = fit(update(form_barren, ~ . + presc * ns(age, knots = 65, Boundary.knots = c(18, 112))), data = df)
+  )
+  i3 <-  switch(best_3, 
+    cub = fit(update(form_barren, ~ . + presc * poly(age, 3)), data = df),
+    sp2 = fit(update(form_barren, ~ . + presc * ns(age, knots = c(50, 80), Boundary.knots = c(18, 112))), data = df)
+  )
+  
+  i_ic <- map_dbl(list(i1, i2, i3), IC)
+  names(i_ic) <- c("lin", best_2, best_3)
+  
+  # Choose best
+  list(
+    ni_ic = ni_ic,
+    ni_mod_1 = slim(lin), 
+    ni_mod_2 = slim(ni_mod[[best_2]]),
+    ni_mod_3 = slim(ni_mod[[best_3]]),
+    
+    s_ic = s_ic,
+    s_lt = slim(lt),
+    s_gt = slim(gt),
+    
+    i_ic = i_ic,
+    i_mod_1 = slim(i1),
+    i_mod_2 = slim(i2),
+    i_mod_3 = slim(i3)
+  )
+}
+
+```
+
+```{r fit-age-interactions}
+
+# Run this for all the alternative outcomes too
+models_age <- list()
+
+for(out in outcomes){
+  models_age[[out]] <- find_best_age(epi, out, covars)
+}
+
+```
+
+```{r find-best-age-interaction}
+
+get_preferred_form <- function(ics){
+  if(min(ics[c("cub", "sp2")]) < min(ics[c("lin", "qua", "sp1")]) - 10){
+    if_else(ics["cub"] < ics["sp2"], "cub", "sp2")
+  } else if (min(ics[c("qua", "sp1")]) < ics["lin"] - 10){
+    if_else(ics["qua"] < ics["sp1"], "qua", "sp1")
+  } else {
+    "lin"
+  }
+}
+
+get_preferred_model <- function(obj, form){
+  if(form %in% c("cub", "sp2")){
+    obj$i_mod_3
+  } else if(form %in% c("qua", "sp1")){
+    obj$i_mod_2
+  } else {
+    obj$i_mod_1
+  }
+}
+
+pref <- map_chr(map(models_age, "ni_ic"), get_preferred_form)
+pref_diff <- map2_dbl(models_age, pref, ~ .x$ni_ic[.y] - .x$i_ic[.y])
+pref_mods <- map2(models_age, pref, get_preferred_model)
+pref_labels <- c(
+  lin = "Linear",
+  qua = "Quadratic",
+  cub = "Cubic",
+  sp1 = "Spline (1 knot)",
+  sp2 = "Spline (2 knots)"
+)
+
+tbl_3_pref <- data.table(
+  outcome = names(pref),
+  pref = pref_labels[pref]
+)
+
+
+```
+
+```{r table-stratification}
+
+tabulate_strata <- function(obj){
+  lt <- or_p(obj$s_lt)[term == "prescno", .(lt_or = or)]
+  gt <- or_p(obj$s_gt)[term == "prescno", .(gt_or = or)]
+  cbind(lt, gt)
+}
+
+tbl_3_strata <- map_df(models_age, tabulate_strata, .id = "outcome")
+
+```
+
+```{r table-interaction}
+
+age_effect <- function(obj, at, C){
+  
+  beta <- coef(obj)
+  coefs <- data.table(
+    term = str_c(at, " years"),
+    estimate = as.vector(beta %*% t(C)),
+    se = sqrt(diag(C %*% get_var(obj) %*% t(C)))
+  )
+  
+  coefs[, conf.low := .(estimate + qnorm(0.025) * se)]
+  coefs[, conf.high := .(estimate + qnorm(0.975) * se)]
+  
+  format_or(coefs, TRUE)
+}
+
+get_var <- function(obj){
+  UseMethod("get_var")
+}
+
+get_var.glm <- function(obj, at, C){
+  vcov(obj)
+}
+
+get_vcov.geeglm <- function(obj, at, C){
+  obj$geese$vbeta
+}
+
+# Set up the evaluation 
+ages <- c(25, 45, 65, 85)
+
+mat_base <- matrix(c(rep(0, 26), 1), ncol = 27, nrow = length(ages), byrow = TRUE)
+mats <- list(
+  lin = cbind(mat_base, 0, predict(poly(epi$age, 1), ages)),
+  qua = cbind(mat_base, 0, 0,  predict(poly(epi$age, 2), ages)),
+  cub = cbind(mat_base, 0, 0, 0, predict(poly(epi$age, 3), ages)),
+  sp1 = cbind(mat_base, 0, 0, ns(ages, knots = 65, Boundary.knots = c(18, 112))),
+  sp2 = cbind(mat_base, 0, 0, 0, ns(ages, knots = c(50, 80), Boundary.knots = c(18, 112)))
+)
+
+tbl_3_int <- pref %>% 
+  map2(pref_mods, ~ age_effect(.y, ages, mats[[.x]])) %>% 
+  map_df(dcast, . ~ term, value.var = "or", .id = "outcome") %>% 
+  select(-one_of("."))
+
+
+```
+
+```{r render-tbl-3}
+
+# Retrieve the appropriate table shell
+shell_3 <- read_excel(file.path(subfolder, "table_shells.xlsx"), sheet = "table_3")
+setDT(shell_3)
+
+shell_3 %<>% escape_column("label")
+
+# Retrieve the data
+tbl_3 <- list(tbl_3_strata, tbl_3_pref, tbl_3_int) %>% 
+  reduce(merge, on = "outcome", sort = FALSE)
+
+# Combine with the shell
+tbl_3 <- merge(shell_3, tbl_3, by = "outcome", sort = FALSE)
+
+# Bolden outcome
+tbl_3[, label := cell_spec(label, "latex", bold = TRUE)]
+
+# Render the table
+tbl_3[, !(c("outcome"))] %>% 
+kable(
+  "latex", 
+  booktabs = TRUE,
+  linesep = "",
+  col.names = c(" ", "<65 years", "$\\\\geq$65 years", "Form", "25 years", "45 years", "65 years", "85 years"),
+  escape = FALSE,
+  caption = "Table 3" 
+) %>% 
+  add_header_above(c(" " = 1, "Stratification" = 2, "Interaction" = 5))
+
+```
+
+
+# Figure 4
+
+```{r create-fig-4}
+
+ages <- seq(20, 95, 5)
+
+marginals_at <- function(obj, age, data){
+  int.rg <- ref_grid(obj, at = list(age = age), data = data)
+  int.em <- emmeans(int.rg, "presc", "age")
+  summary(int.em) %>% as.data.table()
+}
+
+marginals <- function(obj, ages, data){
+  map_df(ages, marginals_at, obj = obj, data = data)
+}
+
+marg <- map_df(pref_mods[c("compl", "died")], marginals, ages, epi, .id = "outcome")
+
+logistic <- function(x) 1 / (1 + exp(-x))
+
+cols <- c("emmean", "asymp.LCL", "asymp.UCL")
+marg[, (cols) := map(.SD, logistic), .SDcols = cols]
+
+```
+
+```{r render-fig-4, fig.width=7, fig.height=8}
+
+ggplot(marg, aes(age, emmean, ymin = asymp.LCL, ymax = asymp.UCL, colour = presc, fill = presc)) + 
+  geom_ribbon(colour = NA, alpha = 0.1) + 
+  geom_line(size = 1) + 
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1), limits = c(0, NA)) + 
+  scale_colour_viridis_d(begin = 0.2, end = 0.5) + 
+  scale_fill_viridis_d(begin = 0.2, end = 0.5) + 
+  guides(fill = NULL, colour = guide_legend(ncol = 2)) + 
+  facet_wrap(~ outcome, ncol = 1, scales = "free_y",
+             labeller = labeller(outcome = function(x) outcome_labels[x])) + 
+  coord_cartesian(expand = FALSE) +
+  labs(x = "\n\nAge at start of UTI episode in years",
+       y = "Marginal probability of experiencing the outcome\n\n", 
+       colour = "Immediate antibiotic", fill = "Immediate antibiotic") +
+  theme_bw() + 
+  theme(
+    legend.position = c(0.27, 0.875), 
+    legend.background = element_rect(fill = "white", color = "black"),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold"),
+    panel.spacing = unit(1.5, "lines"))
+
+ggsave(file.path(subfolder, "03_images", "fig-4.png"), dpi=600, width=7, height=8)
+
+```
+
+
+
+# Number needed to expose to harm
+
+```{r nnh}
+
+# See Bender et al. (2007) for formulas
+
+# This is approximate, but coefficients stay very(!) close
+form <- as.formula(str_c("compl == 'yes' ~ presc + ", str_c(covars, collapse = " + ")))
+mean_model <- fit_glm(formula = form, data = epi) 
+
+as_grid <- with(epi, expand.grid(age = levels(age_65)))
+
+n_boot <- bootstrap_nneh
+n_smpl <- nrow(epi)
+
+
+# Helper functions ------------------------------------------------------------------------
+
+model <- function(data, formula = form, strip = TRUE){
+  # Fit a logistic regression to data. If strip is TRUE, remove unnecessary 
+  # objects within the fitted model to avoid memory overflow.
+  
+  fit <- glm(formula = formula, family = binomial, data = data)
+  
+  if(strip){
+    strip_glm(fit)
+  } else {
+    fit
+  }
+}
+
+nneh_part_by_as <- function(df, .f, .m){
+  # Calculate exposure impact number or number needed to be exposed
+  # for a grid of age and sex levels.
+  
+  val <- pmap_dbl(as_grid, ~ .f(df[age_65 == ..1], .m))
+  names(val) <- as_grid$age
+  val
+}
+
+nneh_boot_ci <- function(dt, .f, idx, models, strata = FALSE){
+  # Calculate confidence intervals for NNEH or EIN from a bootstrap
+  
+  if(deparse(substitute(.f)) == "ein"){
+    exposed <- "no"
+  } else {
+    exposed <- "yes"
+  }
+  
+  if(strata){
+    boot <- map2(idx, models, ~ nneh_part_by_as(dt[.x][presc == (exposed)], .f, .y))
+    nms <- str_c(as_grid$age, as_grid$female)
+  } else {
+    boot <- map2(idx, models, ~ .f(dt[.x][presc == (exposed)], .y))
+    nms <- "all"
+  }
+  
+  boot %>% 
+    map(~ ifelse(. <= 0, Inf, .)) %>% # Replace no effect (=negative) with infinite 
+                                      # (an infinite amount of patients could be treated 
+                                      # without any extra sepsis cases)
+    transpose() %>% 
+    map(~ quantile(., prob = c(0.025, 0.975))) %>% 
+    set_names(nms)
+}
+
+# Number needed to be exposed
+ard_un <- function(unexposed, model){
+  # Exposed in this case means "not prescribed"
+  pr_actual <- predict(model, newdata = unexposed, type = "response")
+  unexposed$presc <- "no"
+  pr_no <- predict(model, newdata = unexposed, type = "response")
+  
+  mean(pr_no - pr_actual) # This is the reverse of the formula in the paper (we calculate "harm")
+}
+
+
+nne <- function(unexposed, model){
+  # Calculate the number needed to be exposed (NNE), i.e. the effect of 
+  # adding exposure to an unexposed population. In the context of 
+  # this study, this would mean not treating previously treated patients
+  # with antibiotics.
+  #
+  # The NNE is the inverse of the ARD in the unexposed population.
+  
+  1 / ard_un(unexposed, model)
+}
+
+  # Point estimates
+nne_all <- nne(epi[presc == "yes"], mean_model)
+print(str_c("The number needed to expose was ", nne_all))
+
+nne_strat <- nneh_part_by_as(epi[presc == "yes"], nne, mean_model)
+print(nne_strat)
+
+  # Bootstrapped confidence intervals
+if(n_boot > 0){
+  set.seed <- 983
+  
+  nne_idx <- rerun(n_boot, sample(1:n_smpl, n_smpl, replace = TRUE))
+  nne_models <- map(nne_idx, ~ model(data = epi[.]))
+  
+  # Confidence interval for the overall effect
+  nne_all_ci <- nneh_boot_ci(epi, nne, nne_idx, nne_models)
+  print(nne_all_ci)
+  
+  # Confidence interval within strata
+  nne_strat_ci <- nneh_boot_ci(epi, nne, nne_idx, nne_models, strata = TRUE)
+  print(nne_strat_ci)
+}
+
+```
+
+
+
+```{r run-everything}
+# Helper chunk to run entire document with RStudio
+```

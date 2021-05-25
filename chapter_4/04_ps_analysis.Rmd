@@ -1,0 +1,581 @@
+---
+title: "04_ps_analysis"
+output:
+  pdf_document: 
+    keep_tex: true
+  html_document: default
+  word_document: default
+params:
+  format: latex
+  fit_method: "glm"
+  ps_type: param
+  recalc: FALSE
+  time_window: 30
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r init, include = FALSE}
+
+# Path from project directory to this file
+# NOTE: must be set in each programme separately
+subfolder <- "chapter_4"
+
+# Initialise the workspace
+source(file.path(subfolder, "00_init.R"))
+
+# Infrastructure packages
+library(knitr)
+library(kableExtra)
+library(broom)
+library(ggplot2)
+library(testthat)
+
+# Analysis packages
+library(MatchIt)
+library(cem)
+library(lsr)
+library(geepack)
+library(survival)
+library(twang)
+library(rbounds)
+library(splines)
+
+# Shorten parameters
+time_window <- params$time_window
+ps_type <- params$ps_type
+format <- params$format
+recalc <- params$recalc
+
+```
+
+```{r determine-method}
+
+if(params$fit_method == "glm"){
+  fit <- fit_glm
+} else if(params$fit_method == "gee") {
+  fit <- fit_gee
+} else{
+  stop("Unsupported fit method supplied.")
+}
+
+```
+
+```{r load_data}
+
+epi <- load_derived(str_c("epi_", time_window))
+setorder(epi, patid, start)
+
+remove(list = str_c("epi_", time_window))
+
+```
+
+```{r remove-males}
+
+epi <- epi[female == "yes"]
+
+```
+
+```{r transform_data}
+
+# Transform outcome and exposure into integer variables to work with all packages
+epi[, treat := as.integer(presc == "no")]     # Treament = "no antibiotic"
+epi[, id := 1:.N]  # assign a short unique id
+
+```
+
+```{r recode-cont}
+
+# NOTE: ensure that the scaling is the same as in base analysis
+epi[, age_scl := .((age - 65) / 5)]
+epi[, hosp_weeks := hosp_nights / 7]
+epi[, hosp_per5 := hosp_n / 5]
+epi[, ae_per5 := ae_n / 5]
+
+```
+
+```{r set_ps_type}
+
+# Define whether to use parametric (logistic regression) or non-parametric (gradient boost regression)
+# Uncomment the desired type
+
+# Set the basic formula
+ps_form <- treat ~ ns(age, knot = 65) + (hosp_30 + ae_30 + abx_30 + home) +
+                   region + imd + year + cci + recur + 
+                   hosp_per5 + hosp_weeks + ae_per5 
+
+ps_path <- file.path(subfolder, mat_dir, 
+                      str_c("epi", time_window, ps_type, "ps.rds", sep = "_"))
+
+if(recalc){
+  if(ps_type == "param"){
+    # Classical logistic regression propensity score without interactions
+    ps_glm_mod <- glm(ps_form, data = epi, family = binomial)
+    epi[, ps := predict(ps_glm_mod, type = "response")]
+  
+  } else {
+    # Non-parametric gradient boosting regression propensity score
+    ps_gbm_mod <- ps(ps_form, data = epi, n.trees = 5000, 
+                     interaction.depth = 4, 
+                     shrinkage = 0.01, 
+                     stop.method = "es.mean",
+                     estimand = "ATT")
+    epi[, ps := ps_gbm_mod$ps$es.mean.ATT]
+  }
+  
+  write_rds(epi, ps_path)
+} else {
+  epi <- read_rds(ps_path)
+}
+
+
+```
+
+```{r common-support}
+
+# Investigate the common support and shape
+epi %>% 
+  mutate(delay = fct_yesno(presc == "no")) %>% 
+  ggplot(aes(ps, fill = delay)) + 
+  geom_histogram(aes(y = ..density.. / 100), binwidth = 0.01, alpha = 0.5, position = position_identity()) + 
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) + 
+  scale_fill_viridis_d(begin = 0.2, end = 0.8, ) + 
+  coord_cartesian(expand = FALSE, xlim = c(0, 0.4), ylim = c(0, 0.4)) + 
+  labs(x = "\nPropensity score", y = "Proportion\n", fill = "Delayed or withheld antibiotics:") + 
+  theme_bw() + 
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold")
+  )
+
+ggsave(file.path(subfolder, "03_images", "fig-5.png"), dpi=600, width=7, height=4)
+
+```
+
+```{r fill-na}
+
+epi[is.na(ttp), ttp := 60]
+epi[is.na(tts), tts := 60]
+epi[is.na(tth), tth := 60]
+epi[is.na(ttd), ttd := 60]
+epi[is.na(constype), constype := 0]
+
+```
+
+
+```{r progression}
+
+# Redefine progression to severe UTI as the main outcome
+epi[, compl := fct_yesno(pyelo == "yes" | sep == "yes" | hosp_uti == "yes" )]
+
+```
+
+```{r ps-match-using-matchit, eval = FALSE}
+
+# NOTE: This code has been retired since it is takes VERY long with the
+#       sample sizes encountered in this project. Instead, a simple 1to1
+#       nearest neighbour matching was implemented below.
+
+
+# Define parameters
+m_meth <- "nearest"
+n_ratio <- 1
+cal <- 1 / 4
+
+m_path <- file.path(subfolder, mat_dir, 
+                    str_c("epi", time_window, ps_type, m_meth, n_ratio, "matchit.rds", sep = "_"))
+
+if(recalc){
+  # Run matching (warning, can take long. Optimal matching not possible due to memory limits)
+  set.seed(556)
+  matched_ps <- matchit(ps_form, 
+                        data = epi, 
+                        distance = epi$ps, 
+                        method = m_meth, 
+                        m.order = "random",
+                        ratio = n_ratio, 
+                        caliper = cal)
+  
+  # Save the matching results
+  write_rds(matched_ps, m_path)
+} else {
+  matched_ps <- read_rds(m_path)
+}
+
+# Extract matched data
+epi_m <- match.data(matched_ps) %>% as.data.table()
+
+```
+
+```{r ps-match-custom}
+
+# NOTE: This takes ~1 hour to run
+
+m_path <- file.path(subfolder, mat_dir, 
+                    str_c("epi", time_window, ps_type, "custom.rds", sep = "_"))
+
+if(recalc){
+  # Separate cases (1) and controls (0)
+  d0 <- epi$ps[epi$treat == 0]
+  names(d0) <- epi$id[epi$treat == 0]
+  
+  d1 <- epi$ps[epi$treat == 1]
+  names(d1) <- epi$id[epi$treat == 1]
+  
+  # Set up the matching 
+  matched_ps <- tibble(
+    case = names(d1),
+    control = NA_character_,
+    distance = NA_real_
+  ) %>% as.data.table()
+  setkey(matched_ps, case)
+  
+  avail <- rep(TRUE, length(d0))
+  names(avail) <- names(d0)
+  
+  # Randomly permute the cases (i.e. randomize the order in which matches are assigned)
+  set.seed(84)
+  d1 <- d1[sample(length(d1))]
+  
+  # From here on, deterministically assign the nearest control to each case
+  # in the order that they were chosen
+  for(i in names(d1)){
+    distance <- abs(d0[avail] - d1[i])
+    pos <- as.integer(which.min(distance))
+    
+    if(length(pos) > 1)
+      pos <- sample(pos, 1)
+    
+    cntrl <- names(distance[pos])
+    dstnc <- as.numeric(distance[pos])
+    
+    matched_ps[i, c("control", "distance") := .(cntrl, dstnc)]
+    
+    avail[names(distance[pos])] <- FALSE
+  }
+  
+  
+  # Apply a caliper to remove matches that aren't comparable enough
+  cal <- 1 / 4 * sd(epi$ps)
+  matched_ps %<>% .[distance < cal]
+
+# Save the matching results
+  write_rds(matched_ps, m_path)
+} else {
+  matched_ps <- read_rds(m_path)
+}
+
+# Extract matched data
+extract_custom_match <- function(data, matched){
+  idx <- with(matched, as.integer(c(case, control)))
+  expect_equal(length(idx), 2 * nrow(matched))
+  data[idx]
+}
+
+epi_m <- extract_custom_match(epi, matched_ps)
+
+```
+
+```{r ipweights}
+
+# Define inverse probability of treatment weights
+epi[, weights := if_else(treat == 1, mean(ps) / ps, mean(1 - ps) / (1 - ps))]
+
+```
+
+```{r define_analysis}
+
+get_form <- function(outcome){
+  as.formula(
+    str_c(outcome, "~ treat + age_scl + region + imd + year + recur + 
+                  cci + smoke + hosp_30 + hosp_per5 + 
+                  hosp_weeks + ae_30 + ae_per5 + abx_30 + home")
+  )
+}
+
+format_model <- function(cfs){
+  cfs %<>% .[tbl_shell, on = .(term)]
+  
+  # Render table
+  tbl <- 
+    cfs[, .(term, or, p.value)] %>%
+    kable(
+      format, 
+      booktabs = TRUE,
+      linesep = "",
+      escape = FALSE,
+      col.names = c("Patient characteristics", "OR (95%-CI)", "p-value"),
+      caption = "" 
+    ) 
+  
+  tbl
+}
+
+outcomes <- c(
+  "compl" = "compl == 'yes'",
+  "died" = "died == 'yes'",
+  "hosp_lrti" = "hosp_lrti == 'yes'",
+  "other_hosp" = "other_hosp == 'yes'"
+)
+
+```
+
+```{r table-shell}
+
+# Load the table shell
+tbl_shell <- read_excel(file.path(subfolder, "table_shells.xlsx"), sheet = "table_2")
+setDT(tbl_shell)
+
+add_shell_headers <- function(rend, shell){
+  # Add the category headers based on the table shell instead of the list
+  # definition that was used above
+  
+  headers <- unique(shell[!is.na(header)]$header)
+  for(h in headers){
+    ids <- which(shell$header == h)
+    rend %<>% group_rows(h, min(ids), max(ids)) 
+  }
+  rend
+}
+
+tbl_shell[term %like% "^presc", term := str_replace(term, "prescno", "treat")]
+
+```
+
+```{r matched-analysis-ps}
+
+m_mods <- names(outcomes) %>% 
+  set_names() %>% 
+  map(~ fit(get_form(outcomes[.]), data = epi_m))
+
+m_tbls <- m_mods %>% 
+  map(or_p) %>% 
+  map(dplyr::select, -p.value)
+
+remove(m_mods)
+
+```
+
+```{r weighted-analysis-ps}
+
+i_mods <- names(outcomes) %>% 
+  set_names() %>% 
+  map(~ fit(get_form(outcomes[.]), data = epi, weights = TRUE))
+
+i_tbls <- i_mods %>% 
+  map(or_p) %>% 
+  map(dplyr::select, -p.value)
+
+remove(i_mods)
+
+```
+
+
+```{r cem}
+
+cat <-c("hosp_30", "ae_30", "abx_30", "home", "region", "imd", "year", "recur", "smoke")
+cont <- c("age", "cci", "hosp_per5", "hosp_weeks", "ae_per5")
+covars <- c(cat, cont)
+
+breaks <- list(
+  age = c(0, 30, 40, 50, 60, 70, 80, 90, 115),
+  cci = c(0, 2 ^ (0:ceiling(log2(max(epi$cci))))),
+  hosp_per5 = c(0, 2 ^ (0:ceiling(log2(max(epi$hosp_per5) * 5))) / 5),
+  hosp_weeks = c(0, 2 ^ (0:ceiling(log2(max(epi$hosp_weeks) * 7))) / 7),
+  ae_per5 = c(0, 2 ^ (0:ceiling(log2(max(epi$ae_per5) * 5))) / 5)
+)
+
+matched_cem <- cem(treatment = "treat", data = epi[, .SD, .SDcols = c("treat", covars)],
+                   cutpoints = breaks)
+epi_c <- epi[matched_cem$matched]                   
+
+```
+
+```{r matched-analysis-cem}
+
+cem_mods <- list(
+  # For the death outcome there are no patients with A&E
+  compl = fit(update(get_form(outcomes["compl"]), ~ .- hosp_per5 - ae_30), data = epi_c),
+  # For the death outcome there are no patients with A&E
+  died = fit(update(get_form(outcomes["died"]), ~ .- hosp_per5 - ae_30), data = epi_c),
+  # For the LRTI outcome there are no patients with A&E
+  hosp_lrti = fit(update(get_form(outcomes["hosp_lrti"]), ~ .- hosp_per5 - ae_30), data = epi_c),
+  # For the LRTI outcome there are no patients with A&E
+  other_hosp = fit(update(get_form(outcomes["other_hosp"]), ~ .- hosp_per5 - ae_30), data = epi_c)
+)
+
+cem_tbls <- cem_mods %>% 
+  map(or_p) %>% 
+  map(dplyr::select, -p.value)
+
+remove(cem_mods)
+
+```
+
+```{r, print_tables}
+
+pmap(list(m_tbls, i_tbls, cem_tbls), ~ inner_join(inner_join(..1, ..2, by = "term"), ..3, by = "term")) %>% 
+  map(kable, format = "latex") %>% 
+  walk(print)
+
+```
+
+```{r imbalance}
+
+describe <- function(dt){
+  # Summarise the number of patients and outcomes after balancing
+  
+  cat("Treated:", table(dt$presc), prop.table(table(dt$presc)), "\n")
+  cat("Progression to severe UTI:", sum(dt$compl == "yes"), "\n")
+  cat("Pyelonephritis:", sum(dt$pyelo == "yes"), "\n")
+  cat("Sepsis:", sum(dt$sep == "yes"), "\n")
+  cat("Death:", sum(dt$died == "yes"), "\n")
+  cat("Hospital UTI:", sum(dt$hosp_uti == "yes"), "\n")
+  cat("Hospital LRTI:", sum(dt$hosp_lrti == "yes"), "\n")
+  cat("Hospital other:", sum(dt$other_hosp == "yes"), "\n")
+}
+
+# Raw
+cat("Raw:\n")
+describe(epi)
+imb_raw <- imbalance(epi$treat, epi[, .SD, .SDcols = covars], breaks = breaks)
+
+# PS matching
+cat("PS matched:\n")
+describe(epi_m)
+imb_psm <- imbalance(epi_m$treat, epi_m[, .SD, .SDcols = covars], breaks = breaks)
+
+# PS weighting
+cat("PS weighting:\n")
+describe(epi)
+imb_psw <- imbalance(epi$treat, epi[, .SD, .SDcols = covars], breaks = breaks, weights = epi$weights)
+
+# CEM matching
+cat("CEM matched:\n")
+describe(epi_c)
+imb_cem <- imbalance(epi_c$treat, epi_c[, .SD, .SDcols = covars], breaks = breaks)
+
+list(imb_raw, imb_psm, imb_cem) %>% 
+  map("tab") %>% 
+  map(as.data.table, keep.rownames = TRUE) %>% 
+  map(dplyr::select, rn, statistic) %>% 
+  map(mutate, statistic = round(statistic, 3)) %>% 
+  reduce(inner_join, by = "rn") %>% 
+  kable(
+    format = "latex", 
+    booktabs = TRUE,
+    col.names = c("var", "raw", "psm", "cem")
+  )
+
+```
+
+```{r covar-balance-after-weight}
+
+imb_psw2 <- dx.wts(epi$weights, data = epi, var = covars, treat.var = "treat", estimand = "ATT")
+
+```
+
+```{r l1}
+
+create_random_breaks <- function(seed = 42){
+  set.seed(seed)
+  list(
+    age = seq(0, 115, length.out = 2 + round(runif(1) * 10)),
+    cci = 2 ^ seq(0, 5, length.out = 2 + round(runif(1) * 10)),
+    hosp_per5 = 2 ^ seq(0, log2(26), length.out = 2 + round(runif(1) * 10)),
+    hosp_weeks = 2 ^ seq(0, log2(74), length.out = 2 + round(runif(1) * 10)),
+    ae_per5 = 2 ^ seq(0, log2(52), length.out = 2 + round(runif(1) * 10))
+  )
+}
+
+calculate_L1 <- function(breaks, treat, data, weights = NULL){
+  
+  if(is.null(weights)){
+    weights <- rep(1, nrow(data))
+  }
+  
+  future.apply::future_sapply(
+    breaks, 
+    function(breaks, treat, data, weights) cem:::cem.imbalance(treat, data, breaks = breaks, weights = weights, reduced = FALSE)$L1, 
+    treat = treat,
+    data = data, 
+    weights = weights
+  )
+}
+
+library(future)
+library(future.apply)
+
+plan(multisession)
+
+
+set.seed(123)
+seeds <- sample.int(2^31, size = 250)
+rnd_breaks <- map(seeds, create_random_breaks)
+
+L1_raw <- calculate_L1(rnd_breaks, epi$treat, epi[, .SD, .SDcols = covars])
+L1_psm <- calculate_L1(rnd_breaks, epi_m$treat, epi_m[, .SD, .SDcols = covars])
+L1_psw <- calculate_L1(rnd_breaks, epi$treat, epi[, .SD, .SDcols = covars], weights = epi$weights)
+L1_cem <- calculate_L1(rnd_breaks, epi_c$treat, epi_c[, .SD, .SDcols = covars])
+
+
+# Find the summary measure using the median
+l1_raw <- median(L1_raw)
+mean(L1_psm[order(L1_raw)][125:126])
+mean(L1_psw[order(L1_raw)][125:126])
+mean(L1_cem[order(L1_raw)][125:126])
+
+
+ggplot(NULL, aes(1:length(L1_raw))) + 
+  geom_line(aes(y = L1_raw[order(L1_raw)], colour = "Raw", linetype = "Raw"), size = 0.8) + 
+  geom_line(aes(y = L1_psm[order(L1_raw)], colour = "PS matching", linetype = "PS matching"), size = 0.8) + 
+  geom_line(aes(y = L1_psw[order(L1_raw)], colour = "PS IPTW", linetype = "PS IPTW"), size = 0.8) + 
+  geom_line(aes(y = L1_cem[order(L1_raw)], colour = "CEM", linetype = "CEM"), size = 0.8) + 
+  scale_colour_manual(
+    "",
+    limits = c("Raw", "PS matching", "PS IPTW", "CEM"), 
+    values = c("red", "#111111", "#111111", "#777777")
+  ) +
+  scale_linetype_manual(
+    "",
+    limits = c("Raw", "PS matching", "PS IPTW", "CEM"), 
+    values = c("solid", "dotdash", "solid", "solid")
+  ) + 
+  coord_cartesian(ylim = c(0, 0.52), expand = FALSE) + 
+  ylab(expression(L[1])) + 
+  theme_bw() + 
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    legend.title = element_blank(),
+    legend.background = element_rect(colour = "black"), 
+    legend.position = c(0.85, 0.2)
+  ) + 
+  annotate("segment", 
+           x = 125.5, xend = 125.5, 
+           y = 0, yend = l1_rawv, 
+           colour = "red", linetype = "dotted") + 
+  annotate("segment", 
+           x = 0, xend = 125.5, 
+           y = l1_raw, yend = l1_raw,
+           colour = "red", linetype = "dotted")
+
+ggsave(file.path(subfolder, "03_images", "appendix.png"), dpi=600, width=7, height=4)
+
+
+
+
+```
+
+
+```{r run-everything}
+# Helper chunk to run entire document with RStudio
+```
